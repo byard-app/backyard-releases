@@ -1,0 +1,140 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SOURCE: byard-app/backyard
+
+jobs:
+  sign:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    environment: release
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      prerelease: ${{ steps.build.outputs.prerelease }}
+    steps:
+      - name: Wait
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: |
+          [ "$GITHUB_REF_TYPE" = tag ] || { echo "::error::not a tag"; exit 1; }
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "::error::bad tag"; exit 1; }
+          [ -n "$GH_TOKEN" ] || { echo "::error::no SOURCE_TOKEN"; exit 1; }
+          version=${GITHUB_REF_NAME#v}
+          prerelease=false
+          [[ "$version" != *-* ]] || prerelease=true
+          commit=$(gh api "repos/$SOURCE/commits/$GITHUB_REF_NAME" --jq .sha)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::no commit"; exit 1; }
+          run=
+          for _ in $(seq 30); do
+            run=$(gh run list -R "$SOURCE" --workflow release.yml --event push --branch "$GITHUB_REF_NAME" \
+              --json databaseId,headSha --jq "map(select(.headSha == \"$commit\")) | .[0].databaseId // empty")
+            [ -z "$run" ] || break
+            sleep 20
+          done
+          [ -n "$run" ] || { echo "::error::no run"; exit 1; }
+          gh run watch "$run" -R "$SOURCE" --exit-status --interval 30 > /dev/null || true
+          conclusion=$(gh run view "$run" -R "$SOURCE" --json conclusion --jq .conclusion)
+          [ "$conclusion" = success ] || { echo "::error::run $conclusion"; exit 1; }
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            echo "commit=$commit"
+            echo "run=$run"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Download
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          RUN: ${{ steps.build.outputs.run }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: gh run download "$RUN" -R "$SOURCE" -n "release-$VERSION" -D dist
+
+      - name: Check
+        working-directory: dist
+        env:
+          VERSION: ${{ steps.build.outputs.version }}
+          COMMIT: ${{ steps.build.outputs.commit }}
+        run: |
+          platforms=(linux-amd64 linux-arm64 macos-arm64)
+          manifest="backyard-$VERSION.manifest"
+          archives=$(for platform in "${platforms[@]}"; do echo "backyard-$VERSION-$platform.tar.gz"; done | sort)
+          files=$(printf '%s\n' "$archives" SHA256SUMS "$manifest" | sort)
+          [ "$(ls -A | sort)" = "$files" ] || { echo "::error::files"; exit 1; }
+          [ "$(cut -d ' ' -f 3 SHA256SUMS | sort)" = "$archives" ] || { echo "::error::SHA256SUMS"; exit 1; }
+          sha256sum --check SHA256SUMS
+          {
+            echo "backyard-release 1"
+            echo "version $VERSION"
+            echo "commit $COMMIT"
+            for platform in "${platforms[@]}"; do
+              archive="backyard-$VERSION-$platform"
+              hash=$(tar -xzOf "$archive.tar.gz" "$archive/backyard" | sha256sum | cut -d ' ' -f 1)
+              echo "$platform $hash"
+            done
+          } > "$RUNNER_TEMP/expected.manifest"
+          diff -u "$RUNNER_TEMP/expected.manifest" "$manifest"
+
+      - name: Sign
+        working-directory: dist
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          MANIFEST: backyard-${{ steps.build.outputs.version }}.manifest
+        run: |
+          [ -n "$RELEASE_SIGNING_KEY" ] || { echo "::error::no RELEASE_SIGNING_KEY"; exit 1; }
+          key="$RUNNER_TEMP/key"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key")
+          ssh-keygen -Y sign -q -f "$key" -n backyard-release "$MANIFEST"
+          printf 'backyard-release namespaces="backyard-release" %s\n' "$(ssh-keygen -y -f "$key")" > "$RUNNER_TEMP/allowed_signers"
+          rm -f "$key"
+          ssh-keygen -Y verify -f "$RUNNER_TEMP/allowed_signers" -I backyard-release \
+            -n backyard-release -s "$MANIFEST.sig" < "$MANIFEST"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: signed-${{ steps.build.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: sign
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: signed-${{ needs.sign.outputs.version }}
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.sign.outputs.version }}
+          PRERELEASE: ${{ needs.sign.outputs.prerelease }}
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          flags=()
+          if [ "$PRERELEASE" = true ]; then
+            flags=(--prerelease --latest=false)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "Backyard $VERSION" \
+            --notes "" "${flags[@]}"
